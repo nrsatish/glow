@@ -417,6 +417,11 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
       printf("Considering node: %s cost: %e memory: %d\n", node->getName().str().c_str(), computeTime_[node], memUsage_[node]);
       int min_cost_proc = -1;
       float min_cost = 1e+10;
+      uint64_t my_comm_size = 0;
+      if(node->getNumResults() > 0) {
+        auto myty = node->getType(0);
+        my_comm_size = myty->getSizeInBytes();
+      }
       for (int i = 0; i < num_processors; i++) {
         printf("Proc: %d cost: %e memory_available: %d\n", i, processor_costs[i], processor_memory_available[i]);
 
@@ -441,18 +446,19 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
             printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, i, processor_costs[2*num_processors + i]);
           }
         }
+        // for outputs, comm size is own produced size.
         for (int j = 0, e = node->getNumResults(); j < e; ++j){
           Node *out = node->getNthResult(j).getNode();
-          if (isa<Storage>(out)) {
-            continue;
-          }
-          auto ty = out->getType(0);
-          uint64_t comm_size = ty->getSizeInBytes();
-          if ( assignment.find(out) != assignment.end() && assignment[out] != i) {
-            ingress_costs[assignment[out]] += comm_size / 3.2e9f;
-            egress_costs[i] += comm_size / 3.2e9f;
-            printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, assignment[out], processor_costs[num_processors + assignment[out]]);
-            printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, i, processor_costs[2*num_processors + i]);
+          for (auto it = out->getUsers().begin(); it != out->getUsers().end(); ++it) {
+            Node* out = it->getUser();
+            printf("User: %s\n", out->getName().str().c_str());
+
+            if ( assignment.find(out) != assignment.end() && assignment[out] != i) {
+              ingress_costs[assignment[out]] += my_comm_size / 3.2e9f;
+              egress_costs[i] += my_comm_size / 3.2e9f;
+              printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, assignment[out], processor_costs[num_processors + assignment[out]]);
+              printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, i, processor_costs[2*num_processors + i]);
+            }
           }
         }
 
@@ -489,14 +495,13 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
         }
         for (int j = 0, e = node->getNumResults(); j < e; ++j){
           Node *out = node->getNthResult(j).getNode();
-          if (isa<Storage>(out)) {
-            continue;
-          }
-          auto ty = out->getType(0);
-          uint64_t comm_size = ty->getSizeInBytes();
-          if ( assignment.find(out) != assignment.end() && assignment[out] != min_cost_proc) {
-            processor_costs[2*num_processors + assignment[out]] += comm_size / 3.2e9;
-            processor_costs[num_processors + min_cost_proc] += comm_size / 3.2e9;
+          for (auto it = out->getUsers().begin(); it != out->getUsers().end(); ++it) {
+            Node* out = it->getUser();
+
+            if ( assignment.find(out) != assignment.end() && assignment[out] != min_cost_proc) {
+              processor_costs[2*num_processors + assignment[out]] += my_comm_size / 3.2e9;
+              processor_costs[num_processors + min_cost_proc] += my_comm_size / 3.2e9;
+            }
           }
         }
       } else {
@@ -531,7 +536,7 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
   // Paritioning algrithm will be applied here).
   // --- TODO
 
-  return mapping;
+  return mapping2;
 }
 
 /// Adjust the logicalDevice ID for each DAGNode. This happens when \p num (i.e.
@@ -704,6 +709,11 @@ DAGNodeList &Partitioner::Partition() {
     assert(F->verify() && "Conversion led to invalid function");
   }
 
+  int count = 0;
+  for (Function *F : funcList) {
+    F->dumpDAG("after_" + std::to_string(count));
+    count++;
+  }
   // TODO: Optional: if (k < number of devices)
   // Check the computation time of each sub-module, and find out the "key"
   // sub-module to decide if duplicating the sub-module is necessary.
