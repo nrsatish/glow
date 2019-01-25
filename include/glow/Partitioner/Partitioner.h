@@ -30,6 +30,7 @@ namespace glow {
 using namespace runtime;
 
 using MemUsageMap = std::unordered_map<Node *, unsigned>;
+using ComputeTimeMap = std::unordered_map<Node *, float>;
 
 /// Helper structure for building a partition. Records a mapping of nodes in the
 /// original function to destination partitions, along with a list of the
@@ -94,6 +95,9 @@ class Partitioner {
   /// The map of each operator and the corresponding memory size.
   MemUsageMap memUsage_;
 
+  /// The map of each operator and the compute runtime
+  ComputeTimeMap computeTime_;
+
   /// Get the representative function (the one with the largest input) and
   /// update the memSize.
   static Function *selectRepFunc(Module *parent, size_t &memSize);
@@ -102,8 +106,15 @@ class Partitioner {
   /// function.
   void initOpMemUsage();
 
+  /// Get the minimal compute time for each op in the function.
+  void initOpComputeTime();
+
   /// Assign nodes to partitions and return the mapping.
   NodeToFunctionMap selectPartitions(Function *F, unsigned availableMemory);
+
+  NodeToFunctionMap selectPartitions2(Function *F, unsigned availableMemory, unsigned num_processors);
+
+  void generate_mapping(Function *F, std::unordered_map<Node*, int>& assignment, NodeToFunctionMap& mapping);
 
   /// Adjust a logicalDevice ID to each DAGNode. It is possible that two
   /// sub-functions need to be assigned into 1 device due to the memory
