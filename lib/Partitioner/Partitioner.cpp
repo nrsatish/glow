@@ -303,7 +303,7 @@ void Partitioner::generate_mapping(Function *F, std::unordered_map<Node*, int>& 
           nodes.push_back(in);
           mapping.add(in, newF);
           bfs.visited.insert(in);
-          //printf("Added node: %s to partition %d\n", in->getName().str().c_str(), k);
+          // printf("Added node: %s to partition %d\n", in->getName().str().c_str(), k);
         }
       }
       if (nodes.size() > 0) {
@@ -360,8 +360,8 @@ static float computeAllocationCost(std::unordered_map<Node*, int>& assignment,
     if ( assignment.find(in) != assignment.end() && assignment[in] != tentative_assignment) {
       tentative_cost.egress_costs[assignment[in]] += comm_size / 3.2e9f;
       tentative_cost.ingress_costs[tentative_assignment] += comm_size / 3.2e9f;
-      //printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, assignment[in], tentative_cost.egress_costs[assignment[in]]);
-      //printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, tentative_assignment, tentative_cost.ingress_costs[tentative_assignment]);
+      // printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, assignment[in], tentative_cost.egress_costs[assignment[in]]);
+      // printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, tentative_assignment, tentative_cost.ingress_costs[tentative_assignment]);
     }
   }
   // (3) Find all outputs that are not assigned to the same node and add
@@ -371,13 +371,13 @@ static float computeAllocationCost(std::unordered_map<Node*, int>& assignment,
     Node *out = node->getNthResult(j).getNode();
     for (auto it = out->getUsers().begin(); it != out->getUsers().end(); ++it) {
       Node* out = it->getUser();
-      //printf("User: %s\n", out->getName().str().c_str());
+      // printf("User: %s\n", out->getName().str().c_str());
 
       if ( assignment.find(out) != assignment.end() && assignment[out] != tentative_assignment) {
         tentative_cost.ingress_costs[assignment[out]] += my_comm_size / 3.2e9f;
         tentative_cost.egress_costs[tentative_assignment] += my_comm_size / 3.2e9f;
-        //printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, assignment[out], tentative_cost.ingress_costs[assignment[out]]);
-        //printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, tentative_assignment, tentative_cost.egress_costs[tentative_assignment]);
+        // printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, assignment[out], tentative_cost.ingress_costs[assignment[out]]);
+        // printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, tentative_assignment, tentative_cost.egress_costs[tentative_assignment]);
       }
     }
   }
@@ -405,18 +405,16 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
   // The following is a copy of selectPartitions for comparison sake.
   /*
   ProcessorCost cost;
-  for (int i = 0; i < num_processors; i++) {
+  for (int i = 0; i < 2*num_processors; i++) {
     cost.processor_costs.push_back(0.f);
     cost.processor_memory_available.push_back(availableMemory);
   }
   BFSLevel bfs = getBFSLevel(F);
   unsigned level = bfs.levels.size();
-  // A list of cut. The graph can be partitioned by levels [level - 1,
-  // cut[0]), [cut[0] - 1, cut[1]), ..., [cut[n], -1).
+  // A list of cut. The graph can be partitioned by levels (cut[0], level - 1],
+  // (cut[1], cut[0] - 1], ..., (-1, cut[n] - 1].
   std::vector<int> cut;
 
-  // Step 1 : get the initial cut based on BFS levels and avaiableMemory.
-  // TODO .. need to remove the duplicated memory usage.
   unsigned mem = 0;
   for (int i = level - 1; i >= 0; i--) {
     unsigned tmp = 0;
@@ -425,10 +423,11 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
       tmp += memUsage_[N];
     }
     if (mem + tmp > availableMemory) {
+      // mem == 0 means the mem usage for one level exceeds the availableMem,
+      // accept it now and will do adjustment later. Otherwise, leave tmp to
+      // next stage by assigning it to mem.
       if (mem == 0) {
-        // This means the mem usage for one level exceeds the availableMem,
-        // accept it now and will do adjustment later.
-        cut.push_back(i + 1);
+        cut.push_back(i - 1);
       } else {
         cut.push_back(i);
         mem = tmp;
@@ -442,23 +441,34 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
   cut.push_back(-1);
 
   // Step 2 : Create the initial mapping between node and functions.
+  int color = 0;
+  Function *newF;
   for (int k = 0, e = cut.size(); k < e; k++) {
-    auto *newF = F->getParent()->createFunction(std::string(F->getName()) +
-                                                "_part" + std::to_string(k));
+    newF = F->getParent()->createFunction(std::string(F->getName()) + "_part" +
+                                          std::to_string(++color));
     mapping.createPartition(newF);
+    unsigned mem = 0;
     for (int i = k > 0 ? cut[k - 1] : level - 1; i > cut[k]; i--) {
       for (int j = 0, e1 = bfs.levels[i].second.size(); j < e1; j++) {
         Node *N = bfs.levels[i].second[j];
+        if (mem + memUsage_[N] > availableMemory) {
+          newF = F->getParent()->createFunction(
+              std::string(F->getName()) + "_part" + std::to_string(++color));
+          mapping.createPartition(newF);
+          mem = memUsage_[N];
+        } else {
+          mem += memUsage_[N];
+        }
         mapping.add(N, newF);
-        cost.processor_memory_available[k] -= memUsage_[N];
-        cost.processor_costs[k] += computeTime_[N];
+        cost.processor_memory_available[color-1] -= memUsage_[N];
+        cost.processor_costs[color-1] += computeTime_[N];
       }
     }
   }
 
   // Print out actual costs and memory
-  for (int i = 0; i < num_processors; i++) {
-    printf("BFS ::: Proc: %d cost: %e memory_available: %d\n", i, cost.processor_costs[i], cost.processor_memory_available[i]);
+  for (int i = 0; i < color; i++) {
+    printf("BFS ::: Partition: %d cost: %e memory_available: %d\n", i, cost.processor_costs[i], cost.processor_memory_available[i]);
   }
   */
 
@@ -517,7 +527,7 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
     bool failed_inner = false;
     std::unordered_map<Node*, int> assignment(nnodes);
     for (auto &node : nodes) {
-      //printf("Considering node: %s cost: %e memory: %d\n", node->getName().str().c_str(), computeTime_[node], memUsage_[node]);
+      // printf("Considering node: %s cost: %e memory: %d\n", node->getName().str().c_str(), computeTime_[node], memUsage_[node]);
 
       // Greedy choice of processor. Try all processors, and for each tentative
       // assignment of the node to each processor, calculate estimated finish time.
@@ -526,11 +536,11 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
       float min_cost = 1e+10;
 
       for (int i = 0; i < num_processors; i++) {
-        //printf("Proc: %d cost: %e memory_available: %d\n", i, cost.processor_costs[i], cost.processor_memory_available[i]);
+        // printf("Proc: %d cost: %e memory_available: %d\n", i, cost.processor_costs[i], cost.processor_memory_available[i]);
         ProcessorCost tentative_cost;
         float estimated_cost = computeAllocationCost(assignment, cost, node, i, computeTime_[node], tentative_cost);
 
-        //printf("Effective finish time: %e\n", estimated_cost);
+        // printf("Effective finish time: %e\n", estimated_cost);
         if (estimated_cost < min_cost
             && cost.processor_memory_available[i] >= memUsage_[node]) {
           min_cost = estimated_cost;
@@ -703,9 +713,9 @@ DAGNodeList &Partitioner::Partition() {
 
   // print out dag before partition1
   F_->dumpDAG("before");
-  
+
   unsigned availMem = deviceInfo_[0].availableMemory;
-  
+
   if (memSize_ < availMem) {
     // No partition is needed. Create DAGNode and return. This root is alway a
     // dummy function.
