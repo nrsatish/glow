@@ -306,12 +306,16 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
                                                 unsigned availableMemory,
                                                 unsigned num_processors) {
   NodeToFunctionMap mapping;
+
+  // Keep track of costs
   std::vector<float> processor_costs(num_processors);
   std::vector<unsigned> processor_memory_available(num_processors);
   for (int i = 0; i < num_processors; i++) {
     processor_costs[i] = 0.f;
     processor_memory_available[i] = availableMemory;
   }
+
+
   BFSLevel bfs = getBFSLevel(F);
   unsigned level = bfs.levels.size();
   // A list of cut. The graph can be partitioned by levels [level - 1,
@@ -358,17 +362,27 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
       }
     }
   }
+
+  // Print out actual costs and memory
   for (int i = 0; i < num_processors; i++) {
     printf("BFS ::: Proc: %d cost: %e memory_available: %d\n", i, processor_costs[i], processor_memory_available[i]);
   }
 
-
+  /// Cost based scheduling
+  /// This is based on a first fit decreasing bib packing
+  /// We define bins for each processor and each communication channel
+  /// 1. Sort all nodes on the basis of decrasing cost
+  /// 2. Assign each node to the processor on which it has the earlier finish time and can fit in memory
+  ///    Take into account communication from any allocations of input/output nodes
+  /// 3. If at some point we cannot find any processor avaialble due to memory fragmentation,
+  ///    restart step 1 with a sort based on decreasing memory size.
   NodeToFunctionMap mapping2;
 
   while(true) {
+    std::vector<unsigned> processor_memory_available(num_processors);
     int comm_devices = 2*num_processors; // ingress and egress for each proc
     std::vector<float> processor_costs(num_processors + comm_devices);
-    std::vector<unsigned> processor_memory_available(num_processors);
+
 
     for (int i = 0; i < (num_processors + comm_devices); i++) {
       processor_costs[i] = 0.f;
