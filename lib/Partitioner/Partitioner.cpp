@@ -241,6 +241,7 @@ void Partitioner::generate_mapping(Function *F, std::unordered_map<Node*, int>& 
   int k = 0; // this is the partition id
 
   while(true) {
+    // find a node that hasnt been "visited" i.e. assigned to a partition
     GraphPreOrderVisitor visitor(*F);
     Node *node = nullptr;
 
@@ -252,11 +253,16 @@ void Partitioner::generate_mapping(Function *F, std::unordered_map<Node*, int>& 
       break;
     }
     if (node == nullptr) {
-      // every non-storage node has been assigned to a function; we are done
+      // every non-storage node has been assigned to a partition; we are done
       break;
     }
 
-    // we have a starting node for BFS
+    // we have a root starting node for BFS
+    // we want to find all connected nodes that have the same processor assignment
+    // These get assigned to a partition.
+
+    // TODO: Fix this so that multiple root nodes at the same level can get
+    // assigned to the same partition.
     bfs.levels.clear();
     int proc_id = assignment[node];
     int current = 0;
@@ -267,9 +273,9 @@ void Partitioner::generate_mapping(Function *F, std::unordered_map<Node*, int>& 
                                                 "_2_part" + std::to_string(k));
 
     mapping.createPartition(newF);
-    printf("Created new partition: %d for proc_id: %d\n", k, proc_id);
+    // printf("Created new partition: %d for proc_id: %d\n", k, proc_id);
     mapping.add(node, newF);
-    printf("Added node: %s to partition %d\n", node->getName().str().c_str(), k);
+    // printf("Added node: %s to partition %d\n", node->getName().str().c_str(), k);
 
     level++;
     while (current < level) {
@@ -285,7 +291,7 @@ void Partitioner::generate_mapping(Function *F, std::unordered_map<Node*, int>& 
           nodes.push_back(in);
           mapping.add(in, newF);
           bfs.visited.insert(in);
-          printf("Added node: %s to partition %d\n", in->getName().str().c_str(), k);
+          //printf("Added node: %s to partition %d\n", in->getName().str().c_str(), k);
         }
       }
       if (nodes.size() > 0) {
@@ -295,10 +301,87 @@ void Partitioner::generate_mapping(Function *F, std::unordered_map<Node*, int>& 
       }
       current++;
     }
+    // finished current partition, increment partition id and find an unvisited node
     k++;
   }
 
   return;
+}
+
+// Storage of costs for processors and links.
+struct ProcessorCost {
+  std::vector<float> egress_costs;
+  std::vector<float> ingress_costs;
+  std::vector<float> processor_costs;
+  std::vector<unsigned> processor_memory_available;
+};
+
+/// Compute finish time given (1) an (partial) allocation of nodes to processors
+/// and (2) a tentative assignment of a node "node" to a processor "tentative_assignment"
+static float computeAllocationCost(std::unordered_map<Node*, int>& assignment,
+                                         struct ProcessorCost& current_cost,
+                                         Node* node,
+                                         int tentative_assignment,
+                                         float node_cost,
+                                         struct ProcessorCost& tentative_cost) {
+  // The idea here is to incrementally update current_cost
+  // (1) Add node_cost to processor_costs to reflect the assignment
+  tentative_cost = current_cost;
+  tentative_cost.processor_costs[tentative_assignment] += node_cost;
+
+  uint64_t my_comm_size = 0;
+  if(node->getNumResults() > 0) {
+    auto myty = node->getType(0);
+    my_comm_size = myty->getSizeInBytes();
+  }
+
+  // (2) Find all inputs that are not assigned to the same node and add
+  //     the communication cost to egress of input and ingress of current node
+
+  for (int j = 0, e = node->getNumInputs(); j < e; ++j) {
+    Node *in = node->getNthInput(j).getNode();
+    if (isa<Storage>(in)) {
+      continue;
+    }
+    auto ty = in->getType(0);
+    uint64_t comm_size = ty->getSizeInBytes();
+    if ( assignment.find(in) != assignment.end() && assignment[in] != tentative_assignment) {
+      tentative_cost.egress_costs[assignment[in]] += comm_size / 3.2e9f;
+      tentative_cost.ingress_costs[tentative_assignment] += comm_size / 3.2e9f;
+      //printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, assignment[in], tentative_cost.egress_costs[assignment[in]]);
+      //printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, tentative_assignment, tentative_cost.ingress_costs[tentative_assignment]);
+    }
+  }
+  // (3) Find all outputs that are not assigned to the same node and add
+  //     the communication cost to ingress of input and egress of current node
+  // for outputs, comm size is own produced size.
+  for (int j = 0, e = node->getNumResults(); j < e; ++j){
+    Node *out = node->getNthResult(j).getNode();
+    for (auto it = out->getUsers().begin(); it != out->getUsers().end(); ++it) {
+      Node* out = it->getUser();
+      //printf("User: %s\n", out->getName().str().c_str());
+
+      if ( assignment.find(out) != assignment.end() && assignment[out] != tentative_assignment) {
+        tentative_cost.ingress_costs[assignment[out]] += my_comm_size / 3.2e9f;
+        tentative_cost.egress_costs[tentative_assignment] += my_comm_size / 3.2e9f;
+        //printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, assignment[out], tentative_cost.ingress_costs[assignment[out]]);
+        //printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, tentative_assignment, tentative_cost.egress_costs[tentative_assignment]);
+      }
+    }
+  }
+
+  // Then find the maximum cost of any of the components to find overall bottleneck
+  float cost = 0;
+  for (float e : tentative_cost.egress_costs) {
+    cost = std::max(cost, e);
+  }
+  for (float i : tentative_cost.ingress_costs) {
+    cost = std::max(cost, i);
+  }
+  for (float p : tentative_cost.processor_costs) {
+    cost = std::max(cost, p);
+  }
+  return cost;
 }
 
 /// Assign nodes to partitions and return the mapping.
@@ -307,15 +390,13 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
                                                 unsigned num_processors) {
   NodeToFunctionMap mapping;
 
-  // Keep track of costs
-  std::vector<float> processor_costs(num_processors);
-  std::vector<unsigned> processor_memory_available(num_processors);
+  // The following is a copy of selectPartitions for comparison sake.
+  /*
+  ProcessorCost cost;
   for (int i = 0; i < num_processors; i++) {
-    processor_costs[i] = 0.f;
-    processor_memory_available[i] = availableMemory;
+    cost.processor_costs.push_back(0.f);
+    cost.processor_memory_available.push_back(availableMemory);
   }
-
-
   BFSLevel bfs = getBFSLevel(F);
   unsigned level = bfs.levels.size();
   // A list of cut. The graph can be partitioned by levels [level - 1,
@@ -357,16 +438,17 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
       for (int j = 0, e1 = bfs.levels[i].second.size(); j < e1; j++) {
         Node *N = bfs.levels[i].second[j];
         mapping.add(N, newF);
-        processor_memory_available[k] -= memUsage_[N];
-        processor_costs[k] += computeTime_[N];
+        cost.processor_memory_available[k] -= memUsage_[N];
+        cost.processor_costs[k] += computeTime_[N];
       }
     }
   }
 
   // Print out actual costs and memory
   for (int i = 0; i < num_processors; i++) {
-    printf("BFS ::: Proc: %d cost: %e memory_available: %d\n", i, processor_costs[i], processor_memory_available[i]);
+    printf("BFS ::: Proc: %d cost: %e memory_available: %d\n", i, cost.processor_costs[i], cost.processor_memory_available[i]);
   }
+  */
 
   /// Cost based scheduling
   /// This is based on a first fit decreasing bib packing
@@ -378,177 +460,117 @@ NodeToFunctionMap Partitioner::selectPartitions2(Function *F,
   ///    restart step 1 with a sort based on decreasing memory size.
   NodeToFunctionMap mapping2;
 
-  while(true) {
-    std::vector<unsigned> processor_memory_available(num_processors);
-    int comm_devices = 2*num_processors; // ingress and egress for each proc
-    std::vector<float> processor_costs(num_processors + comm_devices);
+  // We first try to sort on compute
+  bool sortoncompute = true;
+  bool sortonmemory = false;
 
+  // Loop that will eventually try both options and break out if both dont work.
+  bool failed = false;
+  while(sortoncompute || sortonmemory) {
+    // Keep track of processor costs, memory available, ingress BW and egress BW
+    ProcessorCost cost;
+    cost.processor_costs.resize(num_processors, 0.f);
+    cost.processor_memory_available.resize(num_processors, availableMemory);
+    cost.egress_costs.resize(num_processors, 0.f);
+    cost.ingress_costs.resize(num_processors, 0.f);
 
-    for (int i = 0; i < (num_processors + comm_devices); i++) {
-      processor_costs[i] = 0.f;
-    }
-    for (int i = 0; i < num_processors; i++) {
-      processor_memory_available[i] = availableMemory;
-    }
-
-    bool sortoncompute = true;
-
-    // First we sort nodes based on decreasing costs.
+    // Make a copy of Node pointers since we need to sort the nodes below
     unsigned nnodes = F->getNodes().size();
     std::vector<Node *> nodes;
     for (auto &node : F->getNodes()) {
       nodes.push_back(&node);
     }
 
-
+    // Sort the node pointers based on memory or compute
     if (sortoncompute) {
       ComputeTimeMap& computetime = computeTime_;
       std::sort(nodes.begin(), nodes.end(), [&computetime](Node* n1, Node* n2) {
         return computetime[n1] > computetime[n2];
       });
-    } else {
+    } else if (sortonmemory) {
       MemUsageMap& memusage = memUsage_;
       std::sort(nodes.begin(), nodes.end(), [&memusage](Node* n1, Node* n2) {
         return memusage[n1] > memusage[n2];
       });
+    } else {
+      failed = true;
+      break;
     }
 
     // We iterate through the nodes in sorted order.
-    // For each node, we try to assign it greedily to a processor. We have two
-    // approaches possible here:
-    // (1) we assign the node to the least busy (lowest cost) processor that can
-    //     accommodate the node based on memory constraints
-    // (2) we assign the node to the processor that has the most memory.
-    // The first one will focus on load imbalance more than memory constraints;
-    // the second is the reverse.
-
-    // We likely want to try the first approach first. If it fails becasue at some
-    // point we are unable to assign a node to any processor; then we fallback
-    // to the second approach.
+    // For each node, we try to assign it greedily to a processor
+    // where the overall finish time is lowest. This takes into account
+    // how busy the processor is and communication costs between the
+    // node and its predecessors and successors.
+    bool failed_inner = false;
     std::unordered_map<Node*, int> assignment(nnodes);
-    bool failed = false;
     for (auto &node : nodes) {
-      printf("Considering node: %s cost: %e memory: %d\n", node->getName().str().c_str(), computeTime_[node], memUsage_[node]);
+      //printf("Considering node: %s cost: %e memory: %d\n", node->getName().str().c_str(), computeTime_[node], memUsage_[node]);
+
+      // Greedy choice of processor. Try all processors, and for each tentative
+      // assignment of the node to each processor, calculate estimated finish time.
+      // Choose minimum over all esimated finish times.
       int min_cost_proc = -1;
       float min_cost = 1e+10;
-      uint64_t my_comm_size = 0;
-      if(node->getNumResults() > 0) {
-        auto myty = node->getType(0);
-        my_comm_size = myty->getSizeInBytes();
-      }
+
       for (int i = 0; i < num_processors; i++) {
-        printf("Proc: %d cost: %e memory_available: %d\n", i, processor_costs[i], processor_memory_available[i]);
+        //printf("Proc: %d cost: %e memory_available: %d\n", i, cost.processor_costs[i], cost.processor_memory_available[i]);
+        ProcessorCost tentative_cost;
+        float estimated_cost = computeAllocationCost(assignment, cost, node, i, computeTime_[node], tentative_cost);
 
-        std::vector<float> egress_costs(num_processors);
-        std::vector<float> ingress_costs(num_processors);
-        for(int j = 0; j < num_processors; j++) {
-          egress_costs[j] = processor_costs[num_processors + j];
-          ingress_costs[j] = processor_costs[2*num_processors + j];
-        }
-
-        for (int j = 0, e = node->getNumInputs(); j < e; ++j) {
-          Node *in = node->getNthInput(j).getNode();
-          if (isa<Storage>(in)) {
-            continue;
-          }
-          auto ty = in->getType(0);
-          uint64_t comm_size = ty->getSizeInBytes();
-          if ( assignment.find(in) != assignment.end() && assignment[in] != i) {
-            egress_costs[assignment[in]] += comm_size / 3.2e9f;
-            ingress_costs[i] += comm_size / 3.2e9f;
-            printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, assignment[in], processor_costs[num_processors + assignment[in]]);
-            printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", comm_size / 3.2e9, i, processor_costs[2*num_processors + i]);
-          }
-        }
-        // for outputs, comm size is own produced size.
-        for (int j = 0, e = node->getNumResults(); j < e; ++j){
-          Node *out = node->getNthResult(j).getNode();
-          for (auto it = out->getUsers().begin(); it != out->getUsers().end(); ++it) {
-            Node* out = it->getUser();
-            printf("User: %s\n", out->getName().str().c_str());
-
-            if ( assignment.find(out) != assignment.end() && assignment[out] != i) {
-              ingress_costs[assignment[out]] += my_comm_size / 3.2e9f;
-              egress_costs[i] += my_comm_size / 3.2e9f;
-              printf("Requires ingress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, assignment[out], processor_costs[num_processors + assignment[out]]);
-              printf("Requires egress cost of %e for proc %d (cur cost = %e)\n", my_comm_size / 3.2e9, i, processor_costs[2*num_processors + i]);
-            }
-          }
-        }
-
-        float comm_cost = 0;
-        for (float cost : egress_costs) {
-          comm_cost = std::max(comm_cost, cost);
-        }
-        for (float cost : ingress_costs) {
-          comm_cost = std::max(comm_cost, cost);
-        }
-
-        printf("Effective start time: %e\n", std::max(processor_costs[i], comm_cost));
-        if (std::max(processor_costs[i], comm_cost) < min_cost
-            && processor_memory_available[i] >= memUsage_[node]) {
-          min_cost = std::max(processor_costs[i], comm_cost);
+        //printf("Effective finish time: %e\n", estimated_cost);
+        if (estimated_cost < min_cost
+            && cost.processor_memory_available[i] >= memUsage_[node]) {
+          min_cost = estimated_cost;
           min_cost_proc = i;
         }
       }
-      if(min_cost_proc != -1) {
-        assignment[node] = min_cost_proc;
-        processor_memory_available[min_cost_proc] -= memUsage_[node];
-        processor_costs[min_cost_proc] += computeTime_[node];
-        for (int j = 0, e = node->getNumInputs(); j < e; ++j) {
-          Node *in = node->getNthInput(j).getNode();
-          if (isa<Storage>(in)) {
-            continue;
-          }
-          auto ty = in->getType(0);
-          uint64_t comm_size = ty->getSizeInBytes();
-          if ( assignment.find(in) != assignment.end() && assignment[in] != min_cost_proc) {
-            processor_costs[num_processors + assignment[in]] += comm_size / 3.2e9;
-            processor_costs[2*num_processors + min_cost_proc] += comm_size / 3.2e9;
-          }
-        }
-        for (int j = 0, e = node->getNumResults(); j < e; ++j){
-          Node *out = node->getNthResult(j).getNode();
-          for (auto it = out->getUsers().begin(); it != out->getUsers().end(); ++it) {
-            Node* out = it->getUser();
 
-            if ( assignment.find(out) != assignment.end() && assignment[out] != min_cost_proc) {
-              processor_costs[2*num_processors + assignment[out]] += my_comm_size / 3.2e9;
-              processor_costs[num_processors + min_cost_proc] += my_comm_size / 3.2e9;
-            }
-          }
-        }
-      } else {
+      if (min_cost_proc == -1) {
+        // we didnt find any valid allocation.
+        failed_inner = true;
+        break;
+      }
+
+      assignment[node] = min_cost_proc;
+      cost.processor_memory_available[min_cost_proc] -= memUsage_[node];
+      ProcessorCost next_cost;
+      computeAllocationCost(assignment, cost, node, min_cost_proc, computeTime_[node], next_cost);
+      cost.processor_costs = next_cost.processor_costs;
+      cost.ingress_costs = next_cost.ingress_costs;
+      cost.egress_costs = next_cost.egress_costs;
+
+    }
+
+    if (failed_inner) {
+      if (sortoncompute) {
+        sortoncompute = false;
+        sortonmemory = true;
+        continue;
+      }
+      else {
+        // we have tried both, bail out.
         failed = true;
         break;
       }
     }
-
-    if (failed) {
-      sortoncompute = false;
-      continue;
-    }
+    /*
     for (auto &node : nodes) {
       printf("Node: %s assignment: %d\n", node->getName().str().c_str(), assignment[node]);
     }
     for (int i = 0; i < num_processors; i++) {
-      printf("Proc: %d cost: %e memory_available: %d\n", i, processor_costs[i], processor_memory_available[i]);
+      printf("Proc: %d cost: %e memory_available: %d\n", i, cost.processor_costs[i], cost.processor_memory_available[i]);
     }
     for (int i = 0; i < num_processors; i++) {
-      printf("Proc egress: %d cost: %e \n", i, processor_costs[num_processors + i]);
+      printf("Proc egress: %d cost: %e \n", i, cost.egress_costs[i]);
     }
     for (int i = 0; i < num_processors; i++) {
-      printf("Proc ingress: %d cost: %e \n", i, processor_costs[2*num_processors + i]);
+      printf("Proc ingress: %d cost: %e \n", i, cost.ingress_costs[i]);
     }
+    */
     generate_mapping(F, assignment, mapping2);
     break;
   }
-
-
-
-  // Step 3 : adjust the partition based on performance (Advanced Graph
-  // Paritioning algrithm will be applied here).
-  // --- TODO
 
   return mapping2;
 }
